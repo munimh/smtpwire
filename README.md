@@ -1,5 +1,9 @@
 # smtpwire
 
+[![JSR](https://jsr.io/badges/@munimh/smtpwire)](https://jsr.io/@munimh/smtpwire)
+[![JSR score](https://jsr.io/badges/@munimh/smtpwire/score)](https://jsr.io/@munimh/smtpwire)
+[![CI](https://github.com/munimh/smtpwire/actions/workflows/ci.yml/badge.svg)](https://github.com/munimh/smtpwire/actions/workflows/ci.yml)
+
 A small SMTP client and MIME message builder for Deno, Supabase Edge Functions and other runtimes
 where Node mail libraries don't work well. It has no runtime dependencies.
 
@@ -21,6 +25,9 @@ deno add jsr:@munimh/smtpwire
 npx jsr add @munimh/smtpwire
 bunx jsr add @munimh/smtpwire
 ```
+
+Recent Deno versions wait 24 hours before installing a newly published version. To take a release on
+its first day, pass `--minimum-dependency-age=0` to `deno add` or `deno install`.
 
 ## Quick start (Deno)
 
