@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - name: Format, lint, type-check and doc lint
+        run: deno task check
+      - name: Create a throwaway TLS certificate (outside the workspace)
+        run: sh test/gen_test_cert.sh "$RUNNER_TEMP/certs"
+      - name: Unit tests (fake SMTP server, including real TLS)
+        env:
+          SMTPWIRE_TEST_CA: ${{ runner.temp }}/certs/ca.pem
+          SMTPWIRE_TEST_CERT: ${{ runner.temp }}/certs/cert.pem
+          SMTPWIRE_TEST_KEY: ${{ runner.temp }}/certs/key.pem
+        run: deno task test
+      - name: JSR publish dry run
+        run: deno publish --dry-run
+
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      mailpit:
+        image: axllent/mailpit:v1.33.0
+        ports:
+          - 1025:1025
+          - 8025:8025
+        env:
+          MP_SMTP_AUTH_ACCEPT_ANY: "1"
+          MP_SMTP_AUTH_ALLOW_INSECURE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - name: Wait for Mailpit
+        run: |
+          for i in $(seq 1 30); do
+            curl -fs http://127.0.0.1:8025/api/v1/info && exit 0
+            sleep 1
+          done
+          exit 1
+      - name: Integration tests against Mailpit
+        env:
+          MAILPIT_API: http://127.0.0.1:8025
+          MAILPIT_SMTP_PORT: "1025"
+        run: deno task integration
