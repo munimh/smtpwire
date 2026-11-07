@@ -52,7 +52,7 @@ Deno.test("send(): delivers the message, includes cc and bcc on the envelope, an
   const result = await send(options, {
     ...message,
     cc: "cc@example.com",
-    bcc: ["hidden@example.com", "JANE@example.com"],
+    bcc: ["hidden@example.com", "jane@EXAMPLE.com"],
   });
   assertEquals(result.code, 250);
   assertEquals(result.response, "2.0.0 Ok: queued as FAKE123");
@@ -456,4 +456,99 @@ Deno.test("over real TCP with the Deno and Node connectors", async () => {
     await accepting.catch(() => {});
     await settled(server);
   }
+});
+
+Deno.test("SmtpClient: concurrent send() calls are queued, not interleaved", async () => {
+  const { server, options } = setup({ byteByByte: true });
+  const client = await SmtpClient.connect(options);
+  const targets = ["a1@example.com", "a2@example.com", "a3@example.com", "a4@example.com"];
+  const results = await Promise.all(targets.map((to) => client.send({ ...message, to })));
+  const closing = client.close(); // queued behind any work still in flight
+  await closing;
+  assertEquals(results.map((r) => r.accepted[0]), targets);
+  assertEquals(server.messages.map((m) => m.to[0]), targets);
+  const commands = server.sessions[0]!.commands;
+  assertEquals(commands.filter((c) => c === "MAIL").length, 4);
+  // Each transaction runs MAIL, RCPT, DATA in order with nothing in between.
+  const flow = commands.filter((c) => ["MAIL", "RCPT", "DATA"].includes(c)).join(",");
+  assertEquals(flow, Array(4).fill("MAIL,RCPT,DATA").join(","));
+  assertEquals(commands[commands.length - 1], "QUIT");
+});
+
+Deno.test("duplicate recipients: domain case is ignored, local-part case is kept", async () => {
+  const { server, options } = setup();
+  const result = await send(options, {
+    ...message,
+    to: ["John@example.com", "John@EXAMPLE.com"],
+    cc: "john@example.com",
+  });
+  assertEquals(result.accepted, ["John@example.com", "john@example.com"]);
+  assertEquals(server.messages[0]!.to, ["John@example.com", "john@example.com"]);
+});
+
+Deno.test("an empty envelope sender is sent as the null reverse-path", async () => {
+  const { server, options } = setup();
+  await send(options, { ...message, envelope: { from: "" } });
+  assertEquals(server.sessions[0]!.lines[1], "MAIL FROM:<>");
+  assertEquals(server.messages[0]!.from, "");
+});
+
+Deno.test("8-bit raw messages need 8BITMIME, and 8-bit headers need SMTPUTF8", async () => {
+  const envelope = { from: "a@example.com", to: ["b@example.com"] };
+  const utf8Body = { raw: "Subject: hi\r\n\r\nGrüße\r\n", envelope };
+  const utf8Header = { raw: "Subject: Grüße\r\n\r\nhi\r\n", envelope };
+
+  const plain = setup();
+  await send(plain.options, message); // composeMessage output is 7-bit: no BODY parameter
+  assertEquals(plain.server.sessions[0]!.lines[1], "MAIL FROM:<app@example.com>");
+
+  const ok = setup({ extensions: ["8BITMIME", "SMTPUTF8"] });
+  await send(ok.options, utf8Body);
+  await send(ok.options, utf8Header);
+  assertEquals(ok.server.sessions[0]!.lines[1], "MAIL FROM:<a@example.com> BODY=8BITMIME");
+  assertEquals(
+    ok.server.sessions[1]!.lines[1],
+    "MAIL FROM:<a@example.com> BODY=8BITMIME SMTPUTF8",
+  );
+  assertEquals(ok.server.messages[0]!.data, "Subject: hi\r\n\r\nGrüße\r\n");
+
+  const no8bit = setup({ extensions: [] });
+  await using client = await SmtpClient.connect(no8bit.options);
+  await expectSmtpError(client.send(utf8Body), { stage: "sender", kind: "permanent" });
+  assert(!client.closed, "a local check leaves the connection usable");
+  const noUtf8 = setup({ extensions: ["8BITMIME"] });
+  const err = await expectSmtpError(send(noUtf8.options, utf8Header), {
+    stage: "sender",
+    kind: "permanent",
+  });
+  assertStringIncludes(err.message, "SMTPUTF8");
+  for (const s of [...no8bit.server.sessions, ...noUtf8.server.sessions]) {
+    assert(!s.commands.includes("MAIL"), "nothing was sent");
+  }
+});
+
+Deno.test("AUTH is refused locally when the server offers no authentication", async () => {
+  for (
+    const auth of [
+      { user: "u", accessToken: "token-value" },
+      { user: "u", pass: "p", method: "login" as const },
+    ]
+  ) {
+    const { server, options } = setup(
+      { replies: { EHLO: "250-fake.example.com\r\n250 8BITMIME" } },
+      { auth, allowInsecureAuth: true },
+    );
+    const err = await expectSmtpError(SmtpClient.connect(options), {
+      stage: "auth",
+      kind: "permanent",
+    });
+    assertStringIncludes(err.message, "does not offer authentication");
+    assert(!server.sessions[0]!.commands.includes("AUTH"), "no credentials were sent");
+  }
+  const helo = setup(
+    { replies: { EHLO: "502 5.5.2 What?" } },
+    { auth: { user: "u", pass: "p" }, allowInsecureAuth: true },
+  );
+  await expectSmtpError(SmtpClient.connect(helo.options), { stage: "auth", kind: "permanent" });
+  assertEquals(helo.server.sessions[0]!.commands, ["EHLO", "HELO"]);
 });

@@ -98,7 +98,12 @@ export function encodeWords(text: string, firstMax: number = WORD): string[] {
 export function unstructured(name: string, value: string): string {
   assertSingleLine(value, `The ${name} header`);
   const parts = value.split(" ");
-  if (/^[\x20-\x7e\t]*$/.test(value) && parts.every((p) => p.length <= MAX_PLAIN_WORD)) {
+  // Plain text that looks like an encoded-word would be decoded by mail clients, so it is
+  // encoded too (RFC 2047 section 5 forbids leaving such text as-is).
+  if (
+    /^[\x20-\x7e\t]*$/.test(value) && !value.includes("=?") &&
+    parts.every((p) => p.length <= MAX_PLAIN_WORD)
+  ) {
     return fold(name, parts);
   }
   return fold(name, encodeWords(value, LINE - name.length - 2));
@@ -150,8 +155,10 @@ export function parseAddress(input: Address, what: string): Mailbox {
 
 const PLAIN_PHRASE = /^[A-Za-z0-9!#$%&'*+\-/=?^_`{|}~ ]+$/;
 
-function phraseParts(name: string): string[] {
-  if (!isSevenBit(name) || name.length > MAX_PLAIN_WORD) return encodeWords(name);
+function phraseParts(name: string, firstMax: number): string[] {
+  if (!isSevenBit(name) || name.length > MAX_PLAIN_WORD || name.includes("=?")) {
+    return encodeWords(name, firstMax);
+  }
   if (PLAIN_PHRASE.test(name) && !/^ | $| {2}/.test(name)) return name.split(" ");
   return ['"' + name.replace(/(["\\])/g, "\\$1") + '"'];
 }
@@ -160,8 +167,10 @@ function phraseParts(name: string): string[] {
 export function addressHeader(name: string, mailboxes: readonly Mailbox[]): string {
   const parts: string[] = [];
   mailboxes.forEach((mailbox, index) => {
+    // The first encoded-word must also fit on the line that starts with the header name.
+    const firstMax = index === 0 ? LINE - name.length - 2 : WORD;
     const own = mailbox.name
-      ? [...phraseParts(mailbox.name), `<${mailbox.address}>`]
+      ? [...phraseParts(mailbox.name, firstMax), `<${mailbox.address}>`]
       : [mailbox.address];
     if (index < mailboxes.length - 1) own[own.length - 1] += ",";
     parts.push(...own);

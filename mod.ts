@@ -32,7 +32,12 @@
  * @module
  */
 
-import { type SendReport, SmtpClient, type TransportOptions } from "./src/client.ts";
+import {
+  type RawMessage,
+  type SendReport,
+  SmtpClient,
+  type TransportOptions,
+} from "./src/client.ts";
 import type { Message } from "./src/message.ts";
 
 export {
@@ -72,12 +77,15 @@ export {
  * For several messages, use {@linkcode SmtpClient} to reuse one connection.
  *
  * @param options Server and credential settings.
- * @param message The message to send.
+ * @param message A {@linkcode Message} to build and send, or a {@linkcode RawMessage}.
  * @returns The server's verdict and the accepted recipients.
  * @throws {SmtpError} When any SMTP step fails; check `kind` to decide whether to retry.
  * @throws {MessageError} When the message is invalid. Nothing is sent in that case.
  */
-export async function send(options: TransportOptions, message: Message): Promise<SendReport> {
+export async function send(
+  options: TransportOptions,
+  message: Message | RawMessage,
+): Promise<SendReport> {
   const client = await SmtpClient.connect(options);
   try {
     return await client.send(message);

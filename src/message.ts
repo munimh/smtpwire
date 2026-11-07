@@ -75,7 +75,10 @@ export interface Message {
   messageId?: string;
   /** Overrides the SMTP envelope, which otherwise comes from `from`, `to`, `cc` and `bcc`. */
   envelope?: {
-    /** The envelope sender (`MAIL FROM`), for example a bounce address. */
+    /**
+     * The envelope sender (`MAIL FROM`), for example a bounce address. Use `""` for the
+     * null sender (`MAIL FROM:<>`) when sending bounces or other automatic replies.
+     */
     from?: string;
     /** The envelope recipients (`RCPT TO`). */
     to?: string[];
@@ -330,7 +333,9 @@ export function composeMessage(message: Message): ComposedMessage {
   const envelopeTo = message.envelope?.to ??
     [...to, ...cc, ...bcc].map((m) => m.address);
   const envelopeFrom = message.envelope?.from ?? from.address;
-  for (const address of [envelopeFrom, ...envelopeTo]) parseAddress(address, "The envelope");
+  // An empty envelope sender is the null reverse-path (MAIL FROM:<>) used for bounces.
+  if (envelopeFrom !== "") parseAddress(envelopeFrom, "The envelope sender");
+  for (const address of envelopeTo) parseAddress(address, "The envelope");
 
   return {
     raw: headers.join("\r\n") + "\r\n" + render(body) + "\r\n",

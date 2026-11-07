@@ -1,5 +1,7 @@
 // The swappable network layer and its default Deno implementation.
 
+import { SmtpError } from "./errors.ts";
+
 /**
  * A byte stream to the server. Deno's `Deno.Conn` already has this shape.
  */
@@ -63,8 +65,9 @@ export function denoConnector(options: DenoConnectorOptions = {}): Connector {
 }
 
 function noDefault(): Error {
-  return new Error(
+  return new SmtpError(
     "This runtime has no Deno.connect. Pass `connector: nodeConnector()` from " +
       '"@munimh/smtpwire/node", or your own Connector.',
+    { stage: "connect", kind: "permanent" },
   );
 }

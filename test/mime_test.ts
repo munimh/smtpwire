@@ -286,3 +286,31 @@ Deno.test("an unlikely boundary collision is avoided", () => {
   const boundary = param(parse(raw).headers.get("content-type")!, "boundary")!;
   assertEquals(raw.split(`--${boundary}`).length, 4);
 });
+
+Deno.test("plain text that looks like an encoded-word is encoded, not passed through", () => {
+  const lookalike = "=?UTF-8?B?QWRtaW4=?=";
+  const msg = parse(
+    composeMessage({
+      ...base,
+      subject: lookalike,
+      from: { name: lookalike, address: "a@example.com" },
+      text: "x",
+    }).raw,
+  );
+  assert(msg.headers.get("subject") !== lookalike);
+  assertEquals(decodeWords(msg.headers.get("subject")!), lookalike);
+  assertEquals(decodeWords(msg.headers.get("from")!), `${lookalike} <a@example.com>`);
+});
+
+Deno.test("the first encoded display name fits on the header's first line", () => {
+  for (const name of ["Ünïcödé Ünïcödé Ünïcödé Ünïcödé Ünïcödé", "日本語の名前".repeat(6)]) {
+    const raw = composeMessage({ ...base, from: { name, address: "a@example.com" }, text: "x" })
+      .raw;
+    for (const line of lines(raw)) assert(line.length <= 78, `${line.length}: ${line}`);
+  }
+});
+
+Deno.test("an empty envelope sender is allowed for bounces", () => {
+  const { envelope } = composeMessage({ ...base, text: "x", envelope: { from: "" } });
+  assertEquals(envelope.from, "");
+});

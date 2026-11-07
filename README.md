@@ -115,6 +115,10 @@ for (const to of ["ann@example.com", "bob@example.com"]) {
 If the server refuses one message (a 4xx or 5xx reply to `MAIL FROM`, `RCPT TO` or `DATA`), the
 client sends `RSET` and the connection stays usable for the next message. Any other failure, such as
 a timeout or a dropped connection, closes it. Check `client.closed` to see whether it's still open.
+Calls made at the same time, for example with `Promise.all`, are queued and run one after another.
+
+Repeated recipients are sent once. The domain is compared without regard to case, but the part
+before the @ keeps its case, because some servers treat `John@` and `john@` as different mailboxes.
 
 ## Messages
 
@@ -155,8 +159,17 @@ text readable. Otherwise they are sent as base64. Attachments are always base64.
 
 Names and subjects can contain any Unicode text. They are encoded as RFC 2047 encoded-words (Q or B,
 whichever is shorter) and folded at 78 characters without splitting a character. Non-ASCII
-attachment file names use RFC 2231. Email addresses must be ASCII, because internationalised
-addresses (SMTPUTF8) aren't supported.
+attachment file names use RFC 2231. Text that only looks like an encoded-word (`=?...?=`) is encoded
+too, so mail clients show it as typed. Email addresses must be ASCII, because internationalised
+addresses aren't supported.
+
+To send a bounce or another automatic reply, set `envelope: { from: "" }`. This sends the null
+sender, `MAIL FROM:<>`.
+
+`send()` and `SmtpClient.send()` also accept a ready-made message as
+`{ raw, envelope: { from, to } }`. A raw message may contain UTF-8. In the body this needs the
+server to offer 8BITMIME, and in the headers it also needs SMTPUTF8. If the server doesn't offer
+them, the send fails with a permanent `sender` error before anything is sent.
 
 `composeMessage` throws a `MessageError` and nothing is sent if any of these are true:
 
@@ -210,7 +223,12 @@ the final reply after the message body, because servers often scan content at th
 With `security: "starttls"`, the server must offer STARTTLS. If it doesn't, the connection fails
 rather than carrying on unencrypted. Credentials are never sent over an unencrypted connection
 unless you set `allowInsecureAuth`. `auth.method` picks a mechanism. Otherwise PLAIN is used if the
-server offers it, then LOGIN. Passing `accessToken` selects XOAUTH2.
+server offers it, then LOGIN. Passing `accessToken` selects XOAUTH2. Credentials are only sent when
+the server advertises AUTH and the chosen mechanism. Otherwise connecting fails with a permanent
+`auth` error.
+
+Set `clientName` to your sending host's name (a fully qualified domain name). Some servers penalise
+or reject the default EHLO name, `localhost`.
 
 ## Custom network layers
 

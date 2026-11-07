@@ -2,7 +2,7 @@
 // enhanced status codes (RFC 3463).
 
 import { SmtpError, type SmtpStage } from "./errors.ts";
-import { base64Text, toCrlf, utf8 } from "./encoding.ts";
+import { base64Text, isSevenBit, toCrlf, utf8 } from "./encoding.ts";
 import { type ComposedMessage, composeMessage, type Message } from "./message.ts";
 import { type Connection, type Connector, denoConnector } from "./net.ts";
 import { parseAddress } from "./headers.ts";
@@ -93,7 +93,11 @@ export interface SendReport {
 
 /** An already-built message with its envelope, for example from {@linkcode composeMessage}. */
 export interface RawMessage {
-  /** The complete message. Line breaks are converted to CRLF before sending. */
+  /**
+   * The complete message. Line breaks are converted to CRLF before sending. Non-ASCII
+   * text is sent as UTF-8: in the body it requires the server to offer 8BITMIME, and in
+   * the headers SMTPUTF8 as well; otherwise sending fails before `MAIL FROM`.
+   */
   raw: string;
   /** The envelope. */
   envelope: { from: string; to: string[] };
@@ -147,7 +151,8 @@ async function raceDeadline<T>(
  * many times as needed, then {@linkcode SmtpClient.close}. Supports `await using`.
  *
  * When the server refuses a message (a 4xx or 5xx reply to `MAIL FROM`, `RCPT TO` or
- * `DATA`) the transaction is reset and the connection stays usable. Any other error,
+ * `DATA`) the transaction is reset and the connection stays usable. Calls made at the
+ * same time are queued and run one after another. Any other error,
  * such as a timeout, closes the connection.
  *
  * @example Sending a batch over one connection
@@ -172,6 +177,7 @@ export class SmtpClient {
   #closed = false;
   #secure: boolean;
   #capabilities = new Map<string, string>();
+  #queue: Promise<unknown> = Promise.resolve();
 
   private constructor(conn: Connection, options: TransportOptions, secure: boolean) {
     this.#conn = conn;
@@ -336,6 +342,14 @@ export class SmtpClient {
     const offered = new Set(
       (this.#capabilities.get("AUTH") ?? "").toUpperCase().split(/\s+/).filter(Boolean),
     );
+    if (!offered.size) {
+      // Includes servers that only answered HELO. Sending credentials to a server that
+      // never asked for them gains nothing and exposes them needlessly.
+      throw new SmtpError("The server does not offer authentication", {
+        stage: "auth",
+        kind: "permanent",
+      });
+    }
     let method: "plain" | "login" | "xoauth2";
     if ("accessToken" in auth) method = "xoauth2";
     else if (auth.method) method = auth.method;
@@ -343,13 +357,11 @@ export class SmtpClient {
     else if (offered.has("LOGIN")) method = "login";
     else {
       throw new SmtpError(
-        offered.size
-          ? `The server offers no supported AUTH mechanism (it offers ${[...offered].join(", ")})`
-          : "The server does not offer authentication",
+        `The server offers no supported AUTH mechanism (it offers ${[...offered].join(", ")})`,
         { stage: "auth", kind: "permanent" },
       );
     }
-    if (offered.size && !offered.has(method.toUpperCase())) {
+    if (!offered.has(method.toUpperCase())) {
       throw new SmtpError(`The server does not offer AUTH ${method.toUpperCase()}`, {
         stage: "auth",
         kind: "permanent",
@@ -399,7 +411,21 @@ export class SmtpClient {
    * @throws {SmtpError} At the `sender`, `recipient` or `data` stage.
    * @throws {MessageError} When the message is invalid. Nothing is sent in that case.
    */
-  async send(message: Message | RawMessage): Promise<SendReport> {
+  send(message: Message | RawMessage): Promise<SendReport> {
+    return this.#exclusive(() => this.#send(message));
+  }
+
+  /**
+   * Runs one operation at a time. SMTP is strictly request/response, so calls made
+   * concurrently (for example with Promise.all) must not interleave on the wire.
+   */
+  #exclusive<T>(operation: () => Promise<T>): Promise<T> {
+    const run = this.#queue.then(operation, operation);
+    this.#queue = run.catch(() => {});
+    return run;
+  }
+
+  async #send(message: Message | RawMessage): Promise<SendReport> {
     if (this.#closed) {
       throw new SmtpError("The connection is closed", { stage: "sender", kind: "permanent" });
     }
@@ -408,17 +434,44 @@ export class SmtpClient {
       : composeMessage(message);
     const from = composed.envelope.from;
     const recipients = dedupe(composed.envelope.to);
-    for (const address of [from, ...recipients]) parseAddress(address, "The envelope");
+    // An empty sender is the null reverse-path (MAIL FROM:<>) used for bounces.
+    if (from !== "") parseAddress(from, "The envelope sender");
+    for (const address of recipients) parseAddress(address, "The envelope");
     if (!recipients.length) {
       throw new SmtpError("The message has no recipients", {
         stage: "recipient",
         kind: "permanent",
       });
     }
-    const body = dotStuff(toCrlf(composed.raw));
+    const crlf = toCrlf(composed.raw);
+    const body = dotStuff(crlf);
     const size = utf8(body).length;
+    const headerEnd = crlf.indexOf("\r\n\r\n");
+    const eightBitHeaders = !isSevenBit(headerEnd === -1 ? crlf : crlf.slice(0, headerEnd));
+    const eightBitBody = headerEnd !== -1 && !isSevenBit(crlf.slice(headerEnd));
 
     try {
+      // Messages from composeMessage are always 7-bit. Raw messages with UTF-8 need the
+      // server's consent: 8BITMIME for the body (RFC 6152), SMTPUTF8 for headers (RFC 6531).
+      let params = "";
+      if (eightBitHeaders || eightBitBody) {
+        if (!this.#capabilities.has("8BITMIME")) {
+          throw new SmtpError(
+            "The message contains non-ASCII bytes but the server does not offer 8BITMIME",
+            { stage: "sender", kind: "permanent" },
+          );
+        }
+        params += " BODY=8BITMIME";
+      }
+      if (eightBitHeaders) {
+        if (!this.#capabilities.has("SMTPUTF8")) {
+          throw new SmtpError(
+            "The message has non-ASCII headers but the server does not offer SMTPUTF8",
+            { stage: "sender", kind: "permanent" },
+          );
+        }
+        params += " SMTPUTF8";
+      }
       const limit = Number(this.#capabilities.get("SIZE") ?? 0);
       if (limit > 0 && size > limit) {
         throw new SmtpError(`The message is ${size} bytes; the server accepts at most ${limit}`, {
@@ -427,7 +480,7 @@ export class SmtpClient {
         });
       }
       const sizeParam = this.#capabilities.has("SIZE") ? ` SIZE=${size}` : "";
-      await this.#command(`MAIL FROM:<${from}>${sizeParam}`, "sender", [250]);
+      await this.#command(`MAIL FROM:<${from}>${sizeParam}${params}`, "sender", [250]);
       for (const recipient of recipients) {
         await this.#write(`RCPT TO:<${recipient}>`, "recipient");
         const reply = await this.#read("recipient");
@@ -488,29 +541,33 @@ export class SmtpClient {
    *
    * @throws {SmtpError} If the server does not answer with 250. The connection is closed.
    */
-  async noop(): Promise<void> {
-    try {
-      await this.#command("NOOP", "connect", [250]);
-    } catch (err) {
-      this.#destroy();
-      throw err;
-    }
+  noop(): Promise<void> {
+    return this.#exclusive(async () => {
+      try {
+        await this.#command("NOOP", "connect", [250]);
+      } catch (err) {
+        this.#destroy();
+        throw err;
+      }
+    });
   }
 
   /**
    * Sends `QUIT` and closes the connection. Never throws, and does nothing if the
    * connection is already closed.
    */
-  async close(): Promise<void> {
-    if (this.#closed) return;
-    try {
-      await this.#write("QUIT", "connect", undefined, 5_000);
-      await this.#read("connect", Math.min(this.#options.commandTimeout ?? 30_000, 5_000));
-    } catch {
-      // The server may drop the connection right after QUIT; that is fine.
-    } finally {
-      this.#destroy();
-    }
+  close(): Promise<void> {
+    return this.#exclusive(async () => {
+      if (this.#closed) return;
+      try {
+        await this.#write("QUIT", "connect", undefined, 5_000);
+        await this.#read("connect", Math.min(this.#options.commandTimeout ?? 30_000, 5_000));
+      } catch {
+        // The server may drop the connection right after QUIT; that is fine.
+      } finally {
+        this.#destroy();
+      }
+    });
   }
 
   /** Closes the connection, for `await using`. */
@@ -625,10 +682,15 @@ export class SmtpClient {
   }
 }
 
+/**
+ * Drops repeated recipients. Domains are case-insensitive, but the local part (before
+ * the @) may be case-sensitive (RFC 5321 section 2.4), so its case is kept.
+ */
 function dedupe(addresses: string[]): string[] {
   const seen = new Set<string>();
   return addresses.filter((a) => {
-    const key = a.toLowerCase();
+    const at = a.lastIndexOf("@");
+    const key = a.slice(0, at) + a.slice(at).toLowerCase();
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
